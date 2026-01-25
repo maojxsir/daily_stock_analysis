@@ -52,6 +52,7 @@ from src.core.pipeline import StockAnalysisPipeline
 from src.core.market_review import run_market_review
 from src.search_service import SearchService
 from src.analyzer import GeminiAnalyzer
+from market_sentiment_analyzer import MarketSentimentAnalyzer
 
 # 配置日志格式
 LOG_FORMAT = '%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s'
@@ -260,7 +261,17 @@ def run_full_analysis(
 
         # 2. 运行大盘复盘（如果启用且不是仅个股模式）
         market_report = ""
+        market_sentiment_report = ""
         if config.market_review_enabled and not args.no_market_review:
+            # 2.0 市场情绪与风向分析（与每日 18:00 定时任务一起执行）
+            try:
+                sentiment_analyzer = MarketSentimentAnalyzer(search_service=pipeline.search_service)
+                market_sentiment_report = sentiment_analyzer.run_sentiment_analysis()
+                if market_sentiment_report and not args.no_notify:
+                    pipeline.notifier.send(market_sentiment_report)
+            except Exception as e:
+                logger.warning(f"市场情绪分析失败（已忽略，不影响主流程）: {e}")
+
             # 只调用一次，并获取结果
             review_result = run_market_review(
                 notifier=pipeline.notifier,
@@ -287,7 +298,7 @@ def run_full_analysis(
         # === 新增：生成飞书云文档 ===
         try:
             feishu_doc = FeishuDocManager()
-            if feishu_doc.is_configured() and (results or market_report):
+            if feishu_doc.is_configured() and (results or market_report or market_sentiment_report):
                 logger.info("正在创建飞书云文档...")
 
                 # 1. 准备标题 "01-01 13:01大盘复盘"
@@ -301,6 +312,10 @@ def run_full_analysis(
                 # 添加大盘复盘内容（如果有）
                 if market_report:
                     full_content += f"# 📈 大盘复盘\n\n{market_report}\n\n---\n\n"
+
+                # 添加市场情绪与风向分析（如果有）
+                if market_sentiment_report:
+                    full_content += f"# 📊 市场情绪与风向分析\n\n{market_sentiment_report}\n\n---\n\n"
 
                 # 添加个股决策仪表盘（使用 NotificationService 生成）
                 if results:
