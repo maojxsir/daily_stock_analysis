@@ -245,18 +245,21 @@ class TushareStockInfoProvider(StockInfoProvider):
             return result
 
         industry_by_ts: Dict[str, str] = {}
+        area_by_ts: Dict[str, str] = {}
         mainbiz_by_ts: Dict[str, str] = {}
 
         for part in self._chunk_list(ts_codes, chunk_size):
             ts_code_str = ",".join(part)
             try:
-                df_basic = pro.stock_basic(ts_code=ts_code_str, fields="ts_code,industry")
+                df_basic = pro.stock_basic(ts_code=ts_code_str, fields="ts_code,industry,area")
                 if isinstance(df_basic, pd.DataFrame) and (not df_basic.empty):
                     for _, r in df_basic.iterrows():
                         tsc = str(r.get("ts_code", "") or "").strip()
                         ind = str(r.get("industry", "") or "").strip()
+                        area = str(r.get("area", "") or "").strip()
                         if tsc:
                             industry_by_ts[tsc] = ind
+                            area_by_ts[tsc] = area
             except Exception as e:
                 logger.debug(f"[sentiment] tushare.stock_basic batch failed ({len(part)}): {e}")
 
@@ -279,6 +282,7 @@ class TushareStockInfoProvider(StockInfoProvider):
                 continue
             result[code] = {
                 "industry": industry_by_ts.get(tsc, "") or "",
+                "area": area_by_ts.get(tsc, "") or "",
                 "main_business": mainbiz_by_ts.get(tsc, "") or "",
             }
 
@@ -305,6 +309,7 @@ class LimitStock:
     # 补全字段
     concepts: List[str] = field(default_factory=list)
     industry: str = ""
+    area: str = ""  # 地域板块（省份/城市）
     main_business: str = ""
 
     # 原因字段：优先使用涨/跌停池自带字段，不做启发式推断。
@@ -550,9 +555,20 @@ def _normalize_24h_time(text: Any) -> str:
         is_am = True
         s = re.sub(r"\bAM\b", "", s, flags=re.IGNORECASE).strip()
 
-    # 抽取 H:MM(:SS)
+    # 抽取 H:MM(:SS) 或 HHMMSS（无冒号格式，如 092500）
     m = re.search(r"(\d{1,2}):(\d{2})(?::(\d{2}))?", s)
     if not m:
+        # 尝试匹配无冒号格式 HHMMSS（如 092500）或 HHMM（如 0925）
+        m_no_colon = re.match(r"^(\d{2})(\d{2})(\d{2})?$", s)
+        if m_no_colon:
+            h = int(m_no_colon.group(1))
+            mm = int(m_no_colon.group(2))
+            ss_str = m_no_colon.group(3)
+            sec = int(ss_str) if ss_str else None
+            if sec is not None:
+                return f"{h:02d}:{mm:02d}:{sec:02d}"
+            else:
+                return f"{h:02d}:{mm:02d}"
         return ""
 
     h = int(m.group(1))
@@ -992,11 +1008,12 @@ class MarketSentimentAnalyzer:
         return stocks
 
     def _enrich_basic_info(self, stock: LimitStock) -> None:
-        """通过 provider 体系补全行业与主营业务。"""
+        """通过 provider 体系补全行业、地域与主营业务。"""
         info_key = f"ind_info_{stock.code}"
         cached = self._cache_get(info_key)
         if isinstance(cached, dict):
             stock.industry = cached.get("industry", "") or ""
+            stock.area = cached.get("area", "") or ""
             stock.main_business = _compact_main_business(cached.get("main_business", "") or "")
             return
 
@@ -1005,11 +1022,12 @@ class MarketSentimentAnalyzer:
             stock.main_business = _compact_main_business(stock.main_business)
             self._cache_set(
                 info_key,
-                {"industry": (stock.industry or "").strip(), "main_business": (stock.main_business or "").strip()},
+                {"industry": (stock.industry or "").strip(), "area": (stock.area or "").strip(), "main_business": (stock.main_business or "").strip()},
             )
             return
 
         industry = ""
+        area = ""
         main_business = ""
         used_provider = ""
 
@@ -1020,6 +1038,7 @@ class MarketSentimentAnalyzer:
                 info = p.get_individual_info(stock.code)
                 if isinstance(info, dict):
                     industry = str(info.get("industry", "") or "").strip()
+                    area = str(info.get("area", "") or "").strip()
                     main_business = _compact_main_business(info.get("main_business", "") or "")
                 if industry or main_business:
                     used_provider = getattr(p, "name", p.__class__.__name__)
@@ -1029,8 +1048,9 @@ class MarketSentimentAnalyzer:
                 continue
 
         stock.industry = industry
+        stock.area = area
         stock.main_business = _compact_main_business(main_business)
-        self._cache_set(info_key, {"industry": industry, "main_business": stock.main_business})
+        self._cache_set(info_key, {"industry": industry, "area": area, "main_business": stock.main_business})
         if used_provider:
             logger.debug(f"[sentiment] 基础信息补全成功 {stock.code} via {used_provider}")
 
@@ -1068,8 +1088,9 @@ class MarketSentimentAnalyzer:
             if not isinstance(info, dict):
                 continue
             industry = str(info.get("industry", "") or "").strip()
+            area = str(info.get("area", "") or "").strip()
             main_business = _compact_main_business(info.get("main_business", "") or "")
-            self._cache_set(f"ind_info_{code}", {"industry": industry, "main_business": main_business})
+            self._cache_set(f"ind_info_{code}", {"industry": industry, "area": area, "main_business": main_business})
 
     def _enrich_concepts(self, stock: LimitStock, top_n: int = 5) -> None:
         """通过 efinance（兜底数据源）补全概念/板块信息。"""
@@ -1320,22 +1341,22 @@ class MarketSentimentAnalyzer:
         sentiment.limit_up_stocks = self._parse_limit_stocks(zt_df, is_limit_up=True)
         sentiment.limit_down_stocks = self._parse_limit_stocks(dt_df, is_limit_up=False)
 
-        # 1.1) 排序：按最后涨/跌停时间 -> 成交额 -> 换手率（均为降序）
+        # 1.1) 排序：按最后涨/跌停时间升序（从早到晚）-> 成交额降序 -> 换手率降序
         sentiment.limit_up_stocks.sort(
             key=lambda s: (
-                _time_to_sort_key(getattr(s, "last_limit_time", "")),
-                float(getattr(s, "amount_value", 0.0) or 0.0),
-                float(getattr(s, "turnover_rate", 0.0) or 0.0),
+                _time_to_sort_key(getattr(s, "last_limit_time", "")),  # 时间升序
+                -float(getattr(s, "amount_value", 0.0) or 0.0),        # 成交额降序
+                -float(getattr(s, "turnover_rate", 0.0) or 0.0),       # 换手率降序
             ),
-            reverse=True,
+            reverse=False,
         )
         sentiment.limit_down_stocks.sort(
             key=lambda s: (
-                _time_to_sort_key(getattr(s, "last_limit_time", "")),
-                float(getattr(s, "amount_value", 0.0) or 0.0),
-                float(getattr(s, "turnover_rate", 0.0) or 0.0),
+                _time_to_sort_key(getattr(s, "last_limit_time", "")),  # 时间升序
+                -float(getattr(s, "amount_value", 0.0) or 0.0),        # 成交额降序
+                -float(getattr(s, "turnover_rate", 0.0) or 0.0),       # 换手率降序
             ),
-            reverse=True,
+            reverse=False,
         )
         sentiment.limit_up_count = len(sentiment.limit_up_stocks)
         sentiment.limit_down_count = len(sentiment.limit_down_stocks)
@@ -1450,7 +1471,7 @@ class MarketSentimentAnalyzer:
         lines.append("")
 
         if sentiment.market_activity_legu:
-            lines.append("## 零、市场活跃度（乐咕，AkShare: stock_market_activity_legu）")
+            lines.append("## 市场活跃度")
             lines.append("")
             lines.append("| 指标 | 数值 |")
             lines.append("|---|---|")
@@ -1499,35 +1520,8 @@ class MarketSentimentAnalyzer:
                 lines.append(f"| {c['name']} | {c['count']} |")
             lines.append("")
 
-        if sentiment.top_concept_news:
-            lines.append("## 三、热点概念新闻参考（TOP 5 概念）")
-            lines.append("")
-            for block in sentiment.top_concept_news[:5]:
-                concept = str(block.get("concept", "")).strip()
-                provider = str(block.get("provider", "")).strip()
-                items = block.get("items", []) or []
-                if not concept:
-                    continue
-                provider_text = f"（来源：{provider}）" if provider else ""
-                lines.append(f"### {concept}{provider_text}")
-                lines.append("")
-                if not items:
-                    lines.append("- （无可用搜索结果）")
-                    lines.append("")
-                    continue
-                for it in items[:3]:
-                    title = str(it.get("title", "")).strip()
-                    source = str(it.get("source", "")).strip()
-                    date_str = str(it.get("published_date", "")).strip()
-                    meta = " ".join([x for x in [source, date_str] if x])
-                    if title and meta:
-                        lines.append(f"- {title}（{meta}）")
-                    elif title:
-                        lines.append(f"- {title}")
-                lines.append("")
-
         if sentiment.top_industries:
-            lines.append("## 四、涨停行业分布（按出现次数）")
+            lines.append("## 三、涨停行业分布（按出现次数）")
             lines.append("")
             lines.append("| 行业 | 涨停数量 |")
             lines.append("|---|---:|")
@@ -1535,48 +1529,302 @@ class MarketSentimentAnalyzer:
                 lines.append(f"| {c['name']} | {c['count']} |")
             lines.append("")
 
+        # Helper function to wrap text every 20 characters
+        def _wrap_text(text: str, max_chars: int = 20) -> str:
+            if not text or len(text) <= max_chars:
+                return text
+            result = []
+            for i in range(0, len(text), max_chars):
+                result.append(text[i:i + max_chars])
+            return "<br>".join(result)
+
+        # Limit-up/down stock tables are replaced by images
+        # Images will be generated and sent separately
         if sentiment.limit_up_stocks:
-            lines.append("## 五、涨停股票（前40）")
+            lines.append("## 四、涨停股票（前40）")
             lines.append("")
-            lines.append("| 代码 | 名称 | 涨跌幅 | 换手率 | 成交额(亿) | 最后涨停时间 | 原因 | 概念板块 | 主营业务 |")
-            lines.append("|---|---|---:|---:|---:|---:|---|---|---|")
-            for s in sentiment.limit_up_stocks[:40]:
-                concepts = "、".join((s.concepts or [])[:3]) if s.concepts else ""
-                main_biz = (s.main_business or "").strip()
-                # 这里不再二次截断，main_business 已在上游做过“核心提炼”
-                reason = (s.reason or "").strip()
-                lines.append(
-                    f"| {s.code} | {s.name} | {s.change_pct:.2f}% | {s.turnover_rate:.2f}% | "
-                    f"{(s.amount or '').strip()} | {(s.last_limit_time or '').strip()} | "
-                    f"{reason or ''} | {concepts or ''} | {main_biz or ''} |"
-                )
+            lines.append(f"共 {len(sentiment.limit_up_stocks)} 只涨停股票，详见图片。")
+            lines.append("")
+            lines.append("<!-- LIMIT_UP_IMAGE_PLACEHOLDER -->")
             lines.append("")
 
         if sentiment.limit_down_stocks:
-            lines.append("## 六、跌停股票（前25）")
+            lines.append("## 五、跌停股票（前25）")
             lines.append("")
-            lines.append("| 代码 | 名称 | 涨跌幅 | 换手率 | 成交额(亿) | 原因 | 概念板块 | 主营业务 |")
-            lines.append("|---|---|---:|---:|---:|---|---|---|")
-            for s in sentiment.limit_down_stocks[:25]:
-                concepts = "、".join((s.concepts or [])[:3]) if s.concepts else ""
-                main_biz = (s.main_business or "").strip()
-                # 这里不再二次截断，main_business 已在上游做过“核心提炼”
-                reason = (s.reason or "").strip()
-                lines.append(
-                    f"| {s.code} | {s.name} | {s.change_pct:.2f}% | {s.turnover_rate:.2f}% | "
-                    f"{(s.amount or '').strip()} | {reason or ''} | {concepts or ''} | {main_biz or ''} |"
-                )
+            lines.append(f"共 {len(sentiment.limit_down_stocks)} 只跌停股票，详见图片。")
+            lines.append("")
+            lines.append("<!-- LIMIT_DOWN_IMAGE_PLACEHOLDER -->")
             lines.append("")
 
         lines.append("---")
         lines.append(f"*报告生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*")
         return "\n".join(lines)
 
+    def _generate_limit_table_csv(
+        self,
+        stocks: List[LimitStock],
+        output_path: str,
+        is_limit_up: bool = True,
+    ) -> Optional[str]:
+        """
+        Generate a CSV file for limit-up or limit-down stocks.
+        Stock code is always 6 digits (zero-padded).
+        """
+        if not stocks:
+            return None
+
+        try:
+            import csv
+
+            if is_limit_up:
+                headers = ['代码', '名称', '涨跌幅', '换手率', '成交额(亿)', '涨停时间', '概念板块', '主营业务']
+            else:
+                headers = ['代码', '名称', '涨跌幅', '换手率', '成交额(亿)', '概念板块', '主营业务']
+
+            with open(output_path, 'w', newline='', encoding='utf-8-sig') as f:
+                writer = csv.writer(f)
+                writer.writerow(headers)
+                for s in stocks:
+                    concepts = "、".join((s.concepts or [])[:3]) if s.concepts else ""
+                    main_biz = (s.main_business or "").strip()
+                    # Ensure stock code is 6 digits (zero-padded)
+                    code = str(s.code or "").strip()
+                    if code.isdigit() and len(code) < 6:
+                        code = code.zfill(6)
+
+                    if is_limit_up:
+                        row = [
+                            code,
+                            s.name,
+                            f"{s.change_pct:.2f}%",
+                            f"{s.turnover_rate:.2f}%",
+                            (s.amount or "").strip(),
+                            (s.last_limit_time or "").strip(),
+                            concepts,
+                            main_biz,
+                        ]
+                    else:
+                        row = [
+                            code,
+                            s.name,
+                            f"{s.change_pct:.2f}%",
+                            f"{s.turnover_rate:.2f}%",
+                            (s.amount or "").strip(),
+                            concepts,
+                            main_biz,
+                        ]
+                    writer.writerow(row)
+
+            logger.info(f"[sentiment] CSV文件已生成: {output_path}")
+            return output_path
+
+        except Exception as e:
+            logger.warning(f"[sentiment] 生成CSV文件失败: {e}")
+            return None
+
+    def _generate_limit_table_image(
+        self,
+        stocks: List[LimitStock],
+        title: str,
+        output_path: str,
+        is_limit_up: bool = True,
+    ) -> Optional[str]:
+        """
+        Generate a table image for limit-up or limit-down stocks.
+        Columns are compact except for main_business which shows more content.
+        """
+        if not stocks:
+            return None
+
+        try:
+            import matplotlib
+            matplotlib.use('Agg')  # Use non-interactive backend to avoid blocking
+            import matplotlib.pyplot as plt
+            import matplotlib.font_manager as fm
+
+            # Try to use Chinese font
+            chinese_fonts = ['Hiragino Sans GB', 'STHeiti', 'Heiti TC', 'Songti SC', 'Arial Unicode MS', 'SimHei']
+            font_name = None
+            for cf in chinese_fonts:
+                try:
+                    path = fm.findfont(cf, fallback_to_default=False)
+                    if path and 'DejaVu' not in path:
+                        font_name = cf
+                        break
+                except:
+                    continue
+
+            if font_name:
+                plt.rcParams['font.sans-serif'] = [font_name, 'DejaVu Sans']
+            else:
+                plt.rcParams['font.sans-serif'] = ['Arial Unicode MS', 'DejaVu Sans']
+            plt.rcParams['axes.unicode_minus'] = False
+
+            # Prepare data - compact columns, main_business shows more
+            if is_limit_up:
+                headers = ['代码', '名称', '涨幅', '换手', '成交额', '时间', '概念', '主营业务']
+                # Column widths: compact for most, wide for main_business
+                cell_widths = [0.6, 0.6, 0.5, 0.5, 0.6, 0.5, 1.2, 3.5]
+            else:
+                headers = ['代码', '名称', '跌幅', '换手', '成交额', '概念', '主营业务']
+                cell_widths = [0.6, 0.6, 0.5, 0.5, 0.6, 1.2, 3.5]
+
+            data = []
+            for s in stocks[:40]:  # Limit to 40 rows
+                concepts = "、".join((s.concepts or [])[:2]) if s.concepts else ""
+                if len(concepts) > 10:
+                    concepts = concepts[:8] + ".."
+                main_biz = (s.main_business or "").strip()
+                # Main business truncated to fit column width (max 28 chars)
+                if len(main_biz) > 28:
+                    main_biz = main_biz[:26] + ".."
+
+                if is_limit_up:
+                    row = [
+                        s.code,
+                        s.name[:4] if len(s.name) > 4 else s.name,
+                        f"{s.change_pct:.1f}%",
+                        f"{s.turnover_rate:.1f}%",
+                        (s.amount or "").strip(),
+                        (s.last_limit_time or "").strip(),
+                        concepts,
+                        main_biz,
+                    ]
+                else:
+                    row = [
+                        s.code,
+                        s.name[:4] if len(s.name) > 4 else s.name,
+                        f"{s.change_pct:.1f}%",
+                        f"{s.turnover_rate:.1f}%",
+                        (s.amount or "").strip(),
+                        concepts,
+                        main_biz,
+                    ]
+                data.append(row)
+
+            # Calculate figure size
+            n_rows = len(data) + 1  # +1 for header
+            n_cols = len(headers)
+            cell_height = 0.35
+            fig_width = sum(cell_widths) + 0.3
+            fig_height = n_rows * cell_height + 0.8
+
+            fig, ax = plt.subplots(figsize=(fig_width, fig_height))
+            ax.axis('off')
+            ax.set_title(title, fontsize=12, fontweight='bold', pad=8)
+
+            # Create table
+            table = ax.table(
+                cellText=data,
+                colLabels=headers,
+                cellLoc='center',
+                loc='center',
+                colWidths=[w / sum(cell_widths) for w in cell_widths],
+            )
+
+            # Style the table
+            table.auto_set_font_size(False)
+            table.set_fontsize(8)
+            table.scale(1.1, 1.4)
+
+            # Header style
+            for j in range(n_cols):
+                cell = table[(0, j)]
+                cell.set_facecolor('#4472C4')
+                cell.set_text_props(color='white', fontweight='bold', fontsize=8)
+
+            # Row styles (alternating colors)
+            for i in range(1, n_rows):
+                for j in range(n_cols):
+                    cell = table[(i, j)]
+                    if i % 2 == 0:
+                        cell.set_facecolor('#E7E6E6')
+                    else:
+                        cell.set_facecolor('#FFFFFF')
+                    # Highlight change percentage column
+                    if j == 2:  # Change pct column
+                        try:
+                            pct_val = float(data[i-1][2].replace('%', ''))
+                            if pct_val > 0:
+                                cell.set_text_props(color='#CC0000')
+                            elif pct_val < 0:
+                                cell.set_text_props(color='#00AA00')
+                        except:
+                            pass
+                    # Left-align main_business column (last column)
+                    if j == n_cols - 1:
+                        cell._loc = 'left'
+                        cell.PAD = 0.02
+
+            # Also left-align header for main_business column
+            header_cell = table[(0, n_cols - 1)]
+            header_cell._loc = 'left'
+
+            plt.tight_layout()
+            plt.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='white', pad_inches=0.1)
+            plt.close(fig)
+
+            logger.info(f"[sentiment] 表格图片已生成: {output_path}")
+            return output_path
+
+        except Exception as e:
+            logger.warning(f"[sentiment] 生成表格图片失败: {e}")
+            return None
+
     def run_sentiment_analysis(self) -> str:
         logger.info("[sentiment] 市场情绪与风向分析开始执行...")
         start = time.time()
         sentiment = self.get_market_sentiment()
         report = self.generate_report(sentiment)
+
+        # Generate table images and CSV files
+        today_str = datetime.now().strftime('%Y%m%d')
+        reports_dir = os.path.join(os.path.dirname(__file__), 'src', 'reports')
+        if not os.path.exists(reports_dir):
+            reports_dir = os.path.join(os.path.dirname(__file__), 'reports')
+        if not os.path.exists(reports_dir):
+            os.makedirs(reports_dir, exist_ok=True)
+
+        # Store generated image paths for external access
+        self.limit_up_image_path = None
+        self.limit_down_image_path = None
+
+        if sentiment.limit_up_stocks:
+            # Generate image
+            up_img_path = os.path.join(reports_dir, f'limit_up_table_{today_str}.png')
+            if self._generate_limit_table_image(
+                sentiment.limit_up_stocks[:40],
+                f"涨停股票（{today_str}）",
+                up_img_path,
+                is_limit_up=True
+            ):
+                self.limit_up_image_path = up_img_path
+            # Generate CSV
+            up_csv_path = os.path.join(reports_dir, f'limit_up_table_{today_str}.csv')
+            self._generate_limit_table_csv(
+                sentiment.limit_up_stocks[:40],
+                up_csv_path,
+                is_limit_up=True
+            )
+
+        if sentiment.limit_down_stocks:
+            # Generate image
+            down_img_path = os.path.join(reports_dir, f'limit_down_table_{today_str}.png')
+            if self._generate_limit_table_image(
+                sentiment.limit_down_stocks[:25],
+                f"跌停股票（{today_str}）",
+                down_img_path,
+                is_limit_up=False
+            ):
+                self.limit_down_image_path = down_img_path
+            # Generate CSV
+            down_csv_path = os.path.join(reports_dir, f'limit_down_table_{today_str}.csv')
+            self._generate_limit_table_csv(
+                sentiment.limit_down_stocks[:25],
+                down_csv_path,
+                is_limit_up=False
+            )
+
         logger.info(f"[sentiment] 市场情绪与风向分析执行完成，耗时 {time.time() - start:.1f} 秒。")
         return report
 

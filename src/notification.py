@@ -1523,6 +1523,75 @@ class NotificationService:
             logger.error(f"企业微信请求失败: {response.status_code}")
             return False
 
+    def send_image_to_wechat(self, image_path: str) -> bool:
+        """
+        发送图片到企业微信机器人
+
+        企业微信图片消息格式：
+        {
+            "msgtype": "image",
+            "image": {
+                "base64": "...",
+                "md5": "..."
+            }
+        }
+
+        Args:
+            image_path: 图片文件路径
+
+        Returns:
+            是否发送成功
+        """
+        import base64
+        import hashlib
+        import os
+
+        if not self._wechat_url:
+            logger.warning("企业微信 Webhook 未配置，跳过图片推送")
+            return False
+
+        if not image_path or not os.path.exists(image_path):
+            logger.warning(f"图片文件不存在: {image_path}")
+            return False
+
+        try:
+            # Read image and encode to base64
+            with open(image_path, 'rb') as f:
+                image_data = f.read()
+
+            image_base64 = base64.b64encode(image_data).decode('utf-8')
+            image_md5 = hashlib.md5(image_data).hexdigest()
+
+            payload = {
+                "msgtype": "image",
+                "image": {
+                    "base64": image_base64,
+                    "md5": image_md5
+                }
+            }
+
+            response = requests.post(
+                self._wechat_url,
+                json=payload,
+                timeout=30
+            )
+
+            if response.status_code == 200:
+                result = response.json()
+                if result.get('errcode') == 0:
+                    logger.info(f"企业微信图片发送成功: {os.path.basename(image_path)}")
+                    return True
+                else:
+                    logger.error(f"企业微信图片发送失败: {result}")
+                    return False
+            else:
+                logger.error(f"企业微信图片请求失败: {response.status_code}")
+                return False
+
+        except Exception as e:
+            logger.error(f"发送企业微信图片异常: {e}")
+            return False
+
     def send_to_feishu(self, content: str) -> bool:
         """
         推送消息到飞书机器人
@@ -1565,6 +1634,111 @@ class NotificationService:
             return self._send_feishu_message(formatted_content)
         except Exception as e:
             logger.error(f"发送飞书消息失败: {e}")
+            return False
+
+    def send_image_to_feishu(self, image_path: str) -> bool:
+        """
+        发送图片到飞书机器人
+
+        流程：
+        1. 使用 app_id/app_secret 获取 tenant_access_token
+        2. 上传图片到飞书获取 image_key
+        3. 通过 webhook 发送图片消息
+
+        Args:
+            image_path: 图片文件路径
+
+        Returns:
+            是否发送成功
+        """
+        import os
+        if not self._feishu_url:
+            logger.warning("飞书 Webhook 未配置，跳过图片推送")
+            return False
+
+        if not image_path or not os.path.exists(image_path):
+            logger.warning(f"图片文件不存在: {image_path}")
+            return False
+
+        config = get_config()
+        app_id = getattr(config, 'feishu_app_id', None)
+        app_secret = getattr(config, 'feishu_app_secret', None)
+
+        if not app_id or not app_secret:
+            logger.warning("飞书 App ID/Secret 未配置，无法发送图片")
+            return False
+
+        try:
+            import requests
+
+            # Step 1: Get tenant_access_token
+            token_url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+            token_resp = requests.post(token_url, json={
+                "app_id": app_id,
+                "app_secret": app_secret
+            }, timeout=10)
+            token_data = token_resp.json()
+            if token_data.get("code") != 0:
+                logger.error(f"获取飞书 token 失败: {token_data}")
+                return False
+            access_token = token_data.get("tenant_access_token")
+
+            # Step 2: Upload image
+            upload_url = "https://open.feishu.cn/open-apis/im/v1/images"
+            with open(image_path, 'rb') as f:
+                files = {'image': f}
+                data = {'image_type': 'message'}
+                headers = {'Authorization': f'Bearer {access_token}'}
+                upload_resp = requests.post(upload_url, headers=headers, files=files, data=data, timeout=30)
+            upload_data = upload_resp.json()
+            if upload_data.get("code") != 0:
+                logger.error(f"上传飞书图片失败: {upload_data}")
+                return False
+            image_key = upload_data.get("data", {}).get("image_key")
+            if not image_key:
+                logger.error("获取 image_key 失败")
+                return False
+
+            # Step 3: Send image via webhook using post (rich text) format
+            # Use post format with keyword in title to pass keyword check
+            filename = os.path.basename(image_path)
+            # Determine title based on filename
+            if 'limit_up' in filename:
+                title = "市场情绪与风向分析 - 涨停股票"
+            elif 'limit_down' in filename:
+                title = "市场情绪与风向分析 - 跌停股票"
+            else:
+                title = "市场情绪与风向分析"
+
+            payload = {
+                "msg_type": "post",
+                "content": {
+                    "post": {
+                        "zh_cn": {
+                            "title": title,
+                            "content": [
+                                [
+                                    {
+                                        "tag": "img",
+                                        "image_key": image_key
+                                    }
+                                ]
+                            ]
+                        }
+                    }
+                }
+            }
+            resp = requests.post(self._feishu_url, json=payload, timeout=10)
+            result = resp.json()
+            if result.get("code") == 0 or result.get("StatusCode") == 0:
+                logger.info(f"飞书图片发送成功: {filename}")
+                return True
+            else:
+                logger.error(f"飞书图片发送失败: {result}")
+                return False
+
+        except Exception as e:
+            logger.error(f"发送飞书图片异常: {e}")
             return False
 
     def _send_feishu_chunked(self, content: str, max_bytes: int) -> bool:

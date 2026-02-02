@@ -54,6 +54,72 @@ from src.search_service import SearchService
 from src.analyzer import GeminiAnalyzer
 from market_sentiment_analyzer import MarketSentimentAnalyzer
 
+# 配置日志格式
+LOG_FORMAT = '%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s'
+LOG_DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
+
+
+def setup_logging(debug: bool = False, log_dir: str = "./logs") -> None:
+    """
+    配置日志系统（同时输出到控制台和文件）
+
+    Args:
+        debug: 是否启用调试模式
+        log_dir: 日志文件目录
+    """
+    level = logging.DEBUG if debug else logging.INFO
+
+    # 创建日志目录
+    log_path = Path(log_dir)
+    log_path.mkdir(parents=True, exist_ok=True)
+
+    # 日志文件路径（按日期分文件）
+    today_str = datetime.now().strftime('%Y%m%d')
+    log_file = log_path / f"stock_analysis_{today_str}.log"
+    debug_log_file = log_path / f"stock_analysis_debug_{today_str}.log"
+
+    # 创建根 logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.DEBUG)  # 根 logger 设为 DEBUG，由 handler 控制输出级别
+
+    # Handler 1: 控制台输出
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setLevel(level)
+    console_handler.setFormatter(logging.Formatter(LOG_FORMAT, LOG_DATE_FORMAT))
+    root_logger.addHandler(console_handler)
+
+    # Handler 2: 常规日志文件（INFO 级别，10MB 轮转）
+    file_handler = RotatingFileHandler(
+        log_file,
+        maxBytes=10 * 1024 * 1024,  # 10MB
+        backupCount=5,
+        encoding='utf-8'
+    )
+    file_handler.setLevel(logging.INFO)
+    file_handler.setFormatter(logging.Formatter(LOG_FORMAT, LOG_DATE_FORMAT))
+    root_logger.addHandler(file_handler)
+
+    # Handler 3: 调试日志文件（DEBUG 级别，包含所有详细信息）
+    debug_handler = RotatingFileHandler(
+        debug_log_file,
+        maxBytes=50 * 1024 * 1024,  # 50MB
+        backupCount=3,
+        encoding='utf-8'
+    )
+    debug_handler.setLevel(logging.DEBUG)
+    debug_handler.setFormatter(logging.Formatter(LOG_FORMAT, LOG_DATE_FORMAT))
+    root_logger.addHandler(debug_handler)
+
+    # 降低第三方库的日志级别
+    logging.getLogger('urllib3').setLevel(logging.WARNING)
+    logging.getLogger('sqlalchemy').setLevel(logging.WARNING)
+    logging.getLogger('google').setLevel(logging.WARNING)
+    logging.getLogger('httpx').setLevel(logging.WARNING)
+
+    logging.info(f"日志系统初始化完成，日志目录: {log_path.absolute()}")
+    logging.info(f"常规日志: {log_file}")
+    logging.info(f"调试日志: {debug_log_file}")
+
 
 logger = logging.getLogger(__name__)
 
@@ -200,6 +266,10 @@ def parse_arguments() -> argparse.Namespace:
         '--backtest-force',
         action='store_true',
         help='强制回测（即使已有回测结果也重新计算）'
+    parser.add_argument(
+        '--market-sentiment',
+        action='store_true',
+        help='仅运行市场情绪与风向分析（生成涨停/跌停表格图片并发送到飞书）'
     )
 
     return parser.parse_args()
@@ -255,6 +325,7 @@ def run_full_analysis(
                 sentiment_analyzer = MarketSentimentAnalyzer(search_service=pipeline.search_service)
                 market_sentiment_report = sentiment_analyzer.run_sentiment_analysis()
                 if market_sentiment_report and not args.no_notify:
+                    # Send text report (images are sent within run_sentiment_analysis)
                     pipeline.notifier.send(market_sentiment_report)
             except Exception as e:
                 logger.warning(f"市场情绪分析失败（已忽略，不影响主流程）: {e}")
@@ -347,7 +418,7 @@ def run_full_analysis(
 def start_api_server(host: str, port: int, config: Config) -> None:
     """
     在后台线程启动 FastAPI 服务
-    
+
     Args:
         host: 监听地址
         port: 监听端口
@@ -355,7 +426,7 @@ def start_api_server(host: str, port: int, config: Config) -> None:
     """
     import threading
     import uvicorn
-    
+
     def run_server():
         level_name = (config.log_level or "INFO").lower()
         uvicorn.run(
@@ -365,7 +436,7 @@ def start_api_server(host: str, port: int, config: Config) -> None:
             log_level=level_name,
             log_config=None,
         )
-    
+
     thread = threading.Thread(target=run_server, daemon=True)
     thread.start()
     logger.info(f"FastAPI 服务已启动: http://{host}:{port}")
@@ -419,23 +490,23 @@ def main() -> int:
 
     # 配置日志（输出到控制台和文件）
     setup_logging(log_prefix="stock_analysis", debug=args.debug, log_dir=config.log_dir)
-    
+
     logger.info("=" * 60)
     logger.info("A股自选股智能分析系统 启动")
     logger.info(f"运行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("=" * 60)
-    
+
     # 验证配置
     warnings = config.validate()
     for warning in warnings:
         logger.warning(warning)
-    
+
     # 解析股票列表
     stock_codes = None
     if args.stocks:
         stock_codes = [code.strip() for code in args.stocks.split(',') if code.strip()]
         logger.info(f"使用命令行指定的股票列表: {stock_codes}")
-    
+
     # === 处理 --webui / --webui-only 参数，映射到 --serve / --serve-only ===
     if args.webui:
         args.serve = True
@@ -455,7 +526,7 @@ def main() -> int:
             args.host = os.getenv('WEBUI_HOST')
         if args.port == 8000 and os.getenv('WEBUI_PORT'):
             args.port = int(os.getenv('WEBUI_PORT'))
-    
+
     bot_clients_started = False
     if start_serve:
         try:
@@ -463,10 +534,10 @@ def main() -> int:
             bot_clients_started = True
         except Exception as e:
             logger.error(f"启动 FastAPI 服务失败: {e}")
-    
+
     if bot_clients_started:
         start_bot_stream_clients(config)
-    
+
     # === 仅 Web 服务模式：不自动执行分析 ===
     if args.serve_only:
         logger.info("模式: 仅 Web 服务")
@@ -503,11 +574,11 @@ def main() -> int:
         if args.market_review:
             logger.info("模式: 仅大盘复盘")
             notifier = NotificationService()
-            
+
             # 初始化搜索服务和分析器（如果有配置）
             search_service = None
             analyzer = None
-            
+
             if config.bocha_api_keys or config.tavily_api_keys or config.brave_api_keys or config.serpapi_keys:
                 search_service = SearchService(
                     bocha_keys=config.bocha_api_keys,
@@ -515,7 +586,33 @@ def main() -> int:
                     brave_keys=config.brave_api_keys,
                     serpapi_keys=config.serpapi_keys
                 )
-            
+
+            sentiment_analyzer = MarketSentimentAnalyzer(search_service=search_service)
+            report = sentiment_analyzer.run_sentiment_analysis()
+
+            if report and not args.no_notify:
+                notifier = NotificationService()
+                notifier.send(report)
+
+            logger.info("市场情绪与风向分析完成")
+            return 0
+
+        # 模式1: 仅大盘复盘
+        if args.market_review:
+            logger.info("模式: 仅大盘复盘")
+            notifier = NotificationService()
+
+            # 初始化搜索服务和分析器（如果有配置）
+            search_service = None
+            analyzer = None
+
+            if config.bocha_api_keys or config.tavily_api_keys or config.serpapi_keys:
+                search_service = SearchService(
+                    bocha_keys=config.bocha_api_keys,
+                    tavily_keys=config.tavily_api_keys,
+                    serpapi_keys=config.serpapi_keys
+                )
+
             if config.gemini_api_key or config.openai_api_key:
                 analyzer = GeminiAnalyzer(api_key=config.gemini_api_key)
                 if not analyzer.is_available():
@@ -523,37 +620,37 @@ def main() -> int:
                     analyzer = None
             else:
                 logger.warning("未检测到 API Key (Gemini/OpenAI)，将仅使用模板生成报告")
-            
+
             run_market_review(
-                notifier=notifier, 
-                analyzer=analyzer, 
+                notifier=notifier,
+                analyzer=analyzer,
                 search_service=search_service,
                 send_notification=not args.no_notify
             )
             return 0
-        
+
         # 模式2: 定时任务模式
         if args.schedule or config.schedule_enabled:
             logger.info("模式: 定时任务")
             logger.info(f"每日执行时间: {config.schedule_time}")
-            
+
             from src.scheduler import run_with_schedule
-            
+
             def scheduled_task():
                 run_full_analysis(config, args, stock_codes)
-            
+
             run_with_schedule(
                 task=scheduled_task,
                 schedule_time=config.schedule_time,
                 run_immediately=True  # 启动时先执行一次
             )
             return 0
-        
+
         # 模式3: 正常单次运行
         run_full_analysis(config, args, stock_codes)
-        
+
         logger.info("\n程序执行完成")
-        
+
         # 如果启用了服务且是非定时任务模式，保持程序运行
         keep_running = start_serve and not (args.schedule or config.schedule_enabled)
         if keep_running:
@@ -563,13 +660,13 @@ def main() -> int:
                     time.sleep(1)
             except KeyboardInterrupt:
                 pass
-        
+
         return 0
-        
+
     except KeyboardInterrupt:
         logger.info("\n用户中断，程序退出")
         return 130
-        
+
     except Exception as e:
         logger.exception(f"程序执行失败: {e}")
         return 1
