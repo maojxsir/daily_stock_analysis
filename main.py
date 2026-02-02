@@ -62,32 +62,32 @@ LOG_DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
 def setup_logging(debug: bool = False, log_dir: str = "./logs") -> None:
     """
     配置日志系统（同时输出到控制台和文件）
-    
+
     Args:
         debug: 是否启用调试模式
         log_dir: 日志文件目录
     """
     level = logging.DEBUG if debug else logging.INFO
-    
+
     # 创建日志目录
     log_path = Path(log_dir)
     log_path.mkdir(parents=True, exist_ok=True)
-    
+
     # 日志文件路径（按日期分文件）
     today_str = datetime.now().strftime('%Y%m%d')
     log_file = log_path / f"stock_analysis_{today_str}.log"
     debug_log_file = log_path / f"stock_analysis_debug_{today_str}.log"
-    
+
     # 创建根 logger
     root_logger = logging.getLogger()
     root_logger.setLevel(logging.DEBUG)  # 根 logger 设为 DEBUG，由 handler 控制输出级别
-    
+
     # Handler 1: 控制台输出
     console_handler = logging.StreamHandler(sys.stdout)
     console_handler.setLevel(level)
     console_handler.setFormatter(logging.Formatter(LOG_FORMAT, LOG_DATE_FORMAT))
     root_logger.addHandler(console_handler)
-    
+
     # Handler 2: 常规日志文件（INFO 级别，10MB 轮转）
     file_handler = RotatingFileHandler(
         log_file,
@@ -98,7 +98,7 @@ def setup_logging(debug: bool = False, log_dir: str = "./logs") -> None:
     file_handler.setLevel(logging.INFO)
     file_handler.setFormatter(logging.Formatter(LOG_FORMAT, LOG_DATE_FORMAT))
     root_logger.addHandler(file_handler)
-    
+
     # Handler 3: 调试日志文件（DEBUG 级别，包含所有详细信息）
     debug_handler = RotatingFileHandler(
         debug_log_file,
@@ -109,13 +109,13 @@ def setup_logging(debug: bool = False, log_dir: str = "./logs") -> None:
     debug_handler.setLevel(logging.DEBUG)
     debug_handler.setFormatter(logging.Formatter(LOG_FORMAT, LOG_DATE_FORMAT))
     root_logger.addHandler(debug_handler)
-    
+
     # 降低第三方库的日志级别
     logging.getLogger('urllib3').setLevel(logging.WARNING)
     logging.getLogger('sqlalchemy').setLevel(logging.WARNING)
     logging.getLogger('google').setLevel(logging.WARNING)
     logging.getLogger('httpx').setLevel(logging.WARNING)
-    
+
     logging.info(f"日志系统初始化完成，日志目录: {log_path.absolute()}")
     logging.info(f"常规日志: {log_file}")
     logging.info(f"调试日志: {debug_log_file}")
@@ -141,68 +141,68 @@ def parse_arguments() -> argparse.Namespace:
   python main.py --market-review    # 仅运行大盘复盘
         '''
     )
-    
+
     parser.add_argument(
         '--debug',
         action='store_true',
         help='启用调试模式，输出详细日志'
     )
-    
+
     parser.add_argument(
         '--dry-run',
         action='store_true',
         help='仅获取数据，不进行 AI 分析'
     )
-    
+
     parser.add_argument(
         '--stocks',
         type=str,
         help='指定要分析的股票代码，逗号分隔（覆盖配置文件）'
     )
-    
+
     parser.add_argument(
         '--no-notify',
         action='store_true',
         help='不发送推送通知'
     )
-    
+
     parser.add_argument(
         '--single-notify',
         action='store_true',
         help='启用单股推送模式：每分析完一只股票立即推送，而不是汇总推送'
     )
-    
+
     parser.add_argument(
         '--workers',
         type=int,
         default=None,
         help='并发线程数（默认使用配置值）'
     )
-    
+
     parser.add_argument(
         '--schedule',
         action='store_true',
         help='启用定时任务模式，每日定时执行'
     )
-    
+
     parser.add_argument(
         '--market-review',
         action='store_true',
         help='仅运行大盘复盘分析'
     )
-    
+
     parser.add_argument(
         '--no-market-review',
         action='store_true',
         help='跳过大盘复盘分析'
     )
-    
+
     parser.add_argument(
         '--webui',
         action='store_true',
         help='启动本地配置 WebUI'
     )
-    
+
     parser.add_argument(
         '--webui-only',
         action='store_true',
@@ -214,7 +214,13 @@ def parse_arguments() -> argparse.Namespace:
         action='store_true',
         help='不保存分析上下文快照'
     )
-    
+
+    parser.add_argument(
+        '--market-sentiment',
+        action='store_true',
+        help='仅运行市场情绪与风向分析（生成涨停/跌停表格图片并发送到飞书）'
+    )
+
     return parser.parse_args()
 
 
@@ -225,14 +231,14 @@ def run_full_analysis(
 ):
     """
     执行完整的分析流程（个股 + 大盘复盘）
-    
+
     这是定时任务调用的主函数
     """
     try:
         # 命令行参数 --single-notify 覆盖配置（#55）
         if getattr(args, 'single_notify', False):
             config.single_stock_notify = True
-        
+
         # 创建调度器
         save_context_snapshot = None
         if getattr(args, 'no_context_snapshot', False):
@@ -245,7 +251,7 @@ def run_full_analysis(
             query_source="cli",
             save_context_snapshot=save_context_snapshot
         )
-        
+
         # 1. 运行个股分析
         results = pipeline.run(
             stock_codes=stock_codes,
@@ -268,6 +274,7 @@ def run_full_analysis(
                 sentiment_analyzer = MarketSentimentAnalyzer(search_service=pipeline.search_service)
                 market_sentiment_report = sentiment_analyzer.run_sentiment_analysis()
                 if market_sentiment_report and not args.no_notify:
+                    # Send text report (images are sent within run_sentiment_analysis)
                     pipeline.notifier.send(market_sentiment_report)
             except Exception as e:
                 logger.warning(f"市场情绪分析失败（已忽略，不影响主流程）: {e}")
@@ -282,7 +289,7 @@ def run_full_analysis(
             # 如果有结果，赋值给 market_report 用于后续飞书文档生成
             if review_result:
                 market_report = review_result
-        
+
         # 输出摘要
         if results:
             logger.info("\n===== 分析结果摘要 =====")
@@ -292,7 +299,7 @@ def run_full_analysis(
                     f"{emoji} {r.name}({r.code}): {r.operation_advice} | "
                     f"评分 {r.sentiment_score} | {r.trend_prediction}"
                 )
-        
+
         logger.info("\n任务执行完成")
 
         # === 新增：生成飞书云文档 ===
@@ -332,7 +339,7 @@ def run_full_analysis(
 
         except Exception as e:
             logger.error(f"飞书文档生成失败: {e}")
-        
+
     except Exception as e:
         logger.exception(f"分析流程执行失败: {e}")
 
@@ -373,39 +380,39 @@ def start_bot_stream_clients(config: Config) -> None:
 def main() -> int:
     """
     主入口函数
-    
+
     Returns:
         退出码（0 表示成功）
     """
     # 解析命令行参数
     args = parse_arguments()
-    
+
     # 加载配置（在设置日志前加载，以获取日志目录）
     config = get_config()
-    
+
     # 配置日志（输出到控制台和文件）
     setup_logging(debug=args.debug, log_dir=config.log_dir)
-    
+
     logger.info("=" * 60)
     logger.info("A股自选股智能分析系统 启动")
     logger.info(f"运行时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     logger.info("=" * 60)
-    
+
     # 验证配置
     warnings = config.validate()
     for warning in warnings:
         logger.warning(warning)
-    
+
     # 解析股票列表
     stock_codes = None
     if args.stocks:
         stock_codes = [code.strip() for code in args.stocks.split(',') if code.strip()]
         logger.info(f"使用命令行指定的股票列表: {stock_codes}")
-    
+
     # === 启动 WebUI (如果启用) ===
     # 优先级: 命令行参数 > 配置文件
     start_webui = (args.webui or args.webui_only or config.webui_enabled) and os.getenv("GITHUB_ACTIONS") != "true"
-    
+
     if start_webui:
         try:
             from webui import run_server_in_thread
@@ -413,7 +420,7 @@ def main() -> int:
             start_bot_stream_clients(config)
         except Exception as e:
             logger.error(f"启动 WebUI 失败: {e}")
-    
+
     # === 仅 WebUI 模式：不自动执行分析 ===
     if args.webui_only:
         logger.info("模式: 仅 WebUI 服务")
@@ -428,22 +435,45 @@ def main() -> int:
         return 0
 
     try:
-        # 模式1: 仅大盘复盘
-        if args.market_review:
-            logger.info("模式: 仅大盘复盘")
-            notifier = NotificationService()
-            
-            # 初始化搜索服务和分析器（如果有配置）
+        # 模式0: 仅市场情绪分析
+        if args.market_sentiment:
+            logger.info("模式: 仅市场情绪与风向分析")
+
+            # 初始化搜索服务（可选）
             search_service = None
-            analyzer = None
-            
             if config.bocha_api_keys or config.tavily_api_keys or config.serpapi_keys:
                 search_service = SearchService(
                     bocha_keys=config.bocha_api_keys,
                     tavily_keys=config.tavily_api_keys,
                     serpapi_keys=config.serpapi_keys
                 )
-            
+
+            sentiment_analyzer = MarketSentimentAnalyzer(search_service=search_service)
+            report = sentiment_analyzer.run_sentiment_analysis()
+
+            if report and not args.no_notify:
+                notifier = NotificationService()
+                notifier.send(report)
+
+            logger.info("市场情绪与风向分析完成")
+            return 0
+
+        # 模式1: 仅大盘复盘
+        if args.market_review:
+            logger.info("模式: 仅大盘复盘")
+            notifier = NotificationService()
+
+            # 初始化搜索服务和分析器（如果有配置）
+            search_service = None
+            analyzer = None
+
+            if config.bocha_api_keys or config.tavily_api_keys or config.serpapi_keys:
+                search_service = SearchService(
+                    bocha_keys=config.bocha_api_keys,
+                    tavily_keys=config.tavily_api_keys,
+                    serpapi_keys=config.serpapi_keys
+                )
+
             if config.gemini_api_key or config.openai_api_key:
                 analyzer = GeminiAnalyzer(api_key=config.gemini_api_key)
                 if not analyzer.is_available():
@@ -451,37 +481,37 @@ def main() -> int:
                     analyzer = None
             else:
                 logger.warning("未检测到 API Key (Gemini/OpenAI)，将仅使用模板生成报告")
-            
+
             run_market_review(
-                notifier=notifier, 
-                analyzer=analyzer, 
+                notifier=notifier,
+                analyzer=analyzer,
                 search_service=search_service,
                 send_notification=not args.no_notify
             )
             return 0
-        
+
         # 模式2: 定时任务模式
         if args.schedule or config.schedule_enabled:
             logger.info("模式: 定时任务")
             logger.info(f"每日执行时间: {config.schedule_time}")
-            
+
             from src.scheduler import run_with_schedule
-            
+
             def scheduled_task():
                 run_full_analysis(config, args, stock_codes)
-            
+
             run_with_schedule(
                 task=scheduled_task,
                 schedule_time=config.schedule_time,
                 run_immediately=True  # 启动时先执行一次
             )
             return 0
-        
+
         # 模式3: 正常单次运行
         run_full_analysis(config, args, stock_codes)
-        
+
         logger.info("\n程序执行完成")
-        
+
         # 如果启用了 WebUI 且是非定时任务模式，保持程序运行以便访问 WebUI
         if start_webui and not (args.schedule or config.schedule_enabled):
             logger.info("WebUI 运行中 (按 Ctrl+C 退出)...")
@@ -491,13 +521,13 @@ def main() -> int:
                     time.sleep(1)
             except KeyboardInterrupt:
                 pass
-        
+
         return 0
-        
+
     except KeyboardInterrupt:
         logger.info("\n用户中断，程序退出")
         return 130
-        
+
     except Exception as e:
         logger.exception(f"程序执行失败: {e}")
         return 1
