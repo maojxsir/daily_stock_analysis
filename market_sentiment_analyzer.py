@@ -342,7 +342,8 @@ class MarketSentiment:
     limit_up_stocks: List[LimitStock] = field(default_factory=list)
     limit_down_stocks: List[LimitStock] = field(default_factory=list)
 
-    top_concepts: List[Dict[str, Any]] = field(default_factory=list)
+    top_concepts: List[Dict[str, Any]] = field(default_factory=list)  # 涨停热点概念
+    top_down_concepts: List[Dict[str, Any]] = field(default_factory=list)  # 跌停热点概念
     top_industries: List[Dict[str, Any]] = field(default_factory=list)
 
     # 热点概念新闻参考（按概念搜索，不逐股搜索）
@@ -1149,6 +1150,45 @@ class MarketSentimentAnalyzer:
                 counts[name] = counts.get(name, 0) + 1
         return counts
 
+    @staticmethod
+    def _sort_stocks_by_first_concept(stocks: List[LimitStock]) -> List[LimitStock]:
+        """
+        Sort stocks by first concept keyword, grouping similar concepts together.
+
+        Sorting rules:
+        1. Group by first concept (if exists)
+        2. Within each group, sort by limit time (earlier first)
+        3. Stocks without concepts are placed at the end
+
+        Args:
+            stocks: List of limit stocks
+
+        Returns:
+            Sorted list of limit stocks
+        """
+        if not stocks:
+            return stocks
+
+        def get_first_concept(stock: LimitStock) -> str:
+            """Get the first concept or empty string."""
+            if stock.concepts and len(stock.concepts) > 0:
+                return str(stock.concepts[0]).strip()
+            return ""
+
+        def get_sort_key(stock: LimitStock) -> Tuple[int, str, str]:
+            """
+            Sort key: (has_concept, first_concept, limit_time)
+            - has_concept: 0 if has concept, 1 if not (so stocks with concepts come first)
+            - first_concept: the first concept name for grouping
+            - limit_time: limit time for secondary sorting
+            """
+            first_concept = get_first_concept(stock)
+            has_concept = 0 if first_concept else 1
+            limit_time = getattr(stock, 'last_limit_time', '') or ''
+            return (has_concept, first_concept, limit_time)
+
+        return sorted(stocks, key=get_sort_key)
+
     def _analyze_distributions(self, limit_up_stocks: List[LimitStock]) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
         all_concepts: List[str] = []
         all_industries: List[str] = []
@@ -1157,6 +1197,13 @@ class MarketSentimentAnalyzer:
             if s.industry:
                 all_industries.append(s.industry)
         return self._top_k(all_concepts, k=10), self._top_k(all_industries, k=10)
+
+    def _analyze_down_concepts(self, limit_down_stocks: List[LimitStock]) -> List[Dict[str, Any]]:
+        """Analyze concept distribution for limit-down stocks."""
+        all_concepts: List[str] = []
+        for s in limit_down_stocks:
+            all_concepts.extend(s.concepts or [])
+        return self._top_k(all_concepts, k=10)
 
     def _persist_daily_concept_stats(
         self,
@@ -1405,8 +1452,9 @@ class MarketSentimentAnalyzer:
         # 说明：当开启 market_sentiment_max_analyze_stocks 限制时，只有前 N 只会补全概念；
         # 为避免统计被大量“未补全”稀释，这里以实际补全的集合为准。
         sentiment.top_concepts, sentiment.top_industries = self._analyze_distributions(up_stocks)
+        sentiment.top_down_concepts = self._analyze_down_concepts(down_stocks)
         logger.info(
-            f"[sentiment] 分布统计完成：概念TOP={len(sentiment.top_concepts)}，行业TOP={len(sentiment.top_industries)}"
+            f"[sentiment] 分布统计完成：涨停概念TOP={len(sentiment.top_concepts)}，跌停概念TOP={len(sentiment.top_down_concepts)}，行业TOP={len(sentiment.top_industries)}"
         )
 
         # 3.2) 入库：当日统计（涨停/跌停概念统计）
@@ -1529,32 +1577,30 @@ class MarketSentimentAnalyzer:
                 lines.append(f"| {c['name']} | {c['count']} |")
             lines.append("")
 
-        # Helper function to wrap text every 20 characters
-        def _wrap_text(text: str, max_chars: int = 20) -> str:
-            if not text or len(text) <= max_chars:
-                return text
-            result = []
-            for i in range(0, len(text), max_chars):
-                result.append(text[i:i + max_chars])
-            return "<br>".join(result)
-
-        # Limit-up/down stock tables are replaced by images
-        # Images will be generated and sent separately
-        if sentiment.limit_up_stocks:
-            lines.append("## 四、涨停股票（前40）")
+        if sentiment.top_down_concepts:
+            lines.append("## 四、跌停热点概念（按出现次数）")
             lines.append("")
-            lines.append(f"共 {len(sentiment.limit_up_stocks)} 只涨停股票，详见图片。")
-            lines.append("")
-            lines.append("<!-- LIMIT_UP_IMAGE_PLACEHOLDER -->")
+            lines.append("| 概念 | 跌停数量 |")
+            lines.append("|---|---:|")
+            for c in sentiment.top_down_concepts[:10]:
+                lines.append(f"| {c['name']} | {c['count']} |")
             lines.append("")
 
-        if sentiment.limit_down_stocks:
-            lines.append("## 五、跌停股票（前25）")
-            lines.append("")
-            lines.append(f"共 {len(sentiment.limit_down_stocks)} 只跌停股票，详见图片。")
-            lines.append("")
-            lines.append("<!-- LIMIT_DOWN_IMAGE_PLACEHOLDER -->")
-            lines.append("")
+        # if sentiment.limit_up_stocks:
+        #     lines.append("## 五、涨停股票（前40）")
+        #     lines.append("")
+        #     lines.append(f"共 {len(sentiment.limit_up_stocks)} 只涨停股票，详见图片。")
+        #     lines.append("")
+        #     lines.append("<!-- LIMIT_UP_IMAGE_PLACEHOLDER -->")
+        #     lines.append("")
+
+        # if sentiment.limit_down_stocks:
+        #     lines.append("## 六、跌停股票（前30）")
+        #     lines.append("")
+        #     lines.append(f"共 {len(sentiment.limit_down_stocks)} 只跌停股票，详见图片。")
+        #     lines.append("")
+        #     lines.append("<!-- LIMIT_DOWN_IMAGE_PLACEHOLDER -->")
+        #     lines.append("")
 
         lines.append("---")
         lines.append(f"*报告生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*")
@@ -1642,22 +1688,59 @@ class MarketSentimentAnalyzer:
             import matplotlib.pyplot as plt
             import matplotlib.font_manager as fm
 
-            # Try to use Chinese font
-            chinese_fonts = ['Hiragino Sans GB', 'STHeiti', 'Heiti TC', 'Songti SC', 'Arial Unicode MS', 'SimHei']
+            # Try to use Chinese font (cross-platform: Linux/Docker, macOS, Windows)
+            # Rebuild font cache to ensure newly installed fonts are detected
+            fm._load_fontmanager(try_read_cache=False)
+
+            chinese_fonts = [
+                # Linux/Docker fonts (priority for server deployment)
+                'Noto Sans CJK SC', 'Noto Sans CJK', 'Source Han Sans SC',
+                'Noto Serif CJK SC', 'Noto Serif CJK',  # Serif variant (also common)
+                'WenQuanYi Micro Hei', 'WenQuanYi Zen Hei', 'Droid Sans Fallback',
+                # macOS fonts
+                'PingFang SC', 'Hiragino Sans GB', 'STHeiti', 'Heiti TC', 'Songti SC',
+                # Windows fonts
+                'SimHei', 'Microsoft YaHei', 'SimSun', 'FangSong',
+                # Universal fallback
+                'Arial Unicode MS',
+            ]
             font_name = None
+
+            # Method 1: Try known font names
             for cf in chinese_fonts:
                 try:
                     path = fm.findfont(cf, fallback_to_default=False)
-                    if path and 'DejaVu' not in path:
+                    if path and 'DejaVu' not in path and 'LastResort' not in path:
                         font_name = cf
+                        logger.debug(f"[sentiment] Found Chinese font: {cf} at {path}")
                         break
-                except:
+                except Exception:
                     continue
+
+            # Method 2: Scan all available fonts for CJK support
+            if not font_name:
+                for font in fm.fontManager.ttflist:
+                    fname = font.name.lower()
+                    # Look for fonts with CJK-related keywords
+                    if any(kw in fname for kw in ['cjk', 'noto', 'pingfang', 'heiti', 'simhei',
+                                                   'yahei', 'simsun', 'songti', 'wenquanyi',
+                                                   'source han', 'droid sans fallback']):
+                        font_name = font.name
+                        logger.debug(f"[sentiment] Found CJK font via scan: {font_name} at {font.fname}")
+                        break
 
             if font_name:
                 plt.rcParams['font.sans-serif'] = [font_name, 'DejaVu Sans']
+                plt.rcParams['font.family'] = 'sans-serif'
             else:
-                plt.rcParams['font.sans-serif'] = ['Arial Unicode MS', 'DejaVu Sans']
+                # Fallback: warn user and use default font (Chinese chars may not render)
+                logger.warning(
+                    "[sentiment] No Chinese font found. Chinese characters may not display correctly. "
+                    "Consider installing: fonts-noto-cjk (apt), google-noto-sans-cjk-fonts (yum/dnf), "
+                    "or noto-fonts-cjk (pacman). "
+                    "After installation, delete ~/.cache/matplotlib to refresh font cache."
+                )
+                plt.rcParams['font.sans-serif'] = ['DejaVu Sans']
             plt.rcParams['axes.unicode_minus'] = False
 
             # Prepare data - compact columns, main_business shows more
@@ -1705,21 +1788,34 @@ class MarketSentimentAnalyzer:
             # Calculate figure size
             n_rows = len(data) + 1  # +1 for header
             n_cols = len(headers)
-            cell_height = 0.35
+            cell_height = 0.30
             fig_width = sum(cell_widths) + 0.3
-            fig_height = n_rows * cell_height + 0.8
+            fig_height = n_rows * cell_height + 0.4
 
             fig, ax = plt.subplots(figsize=(fig_width, fig_height))
             ax.axis('off')
-            ax.set_title(title, fontsize=12, fontweight='bold', pad=8)
+            # 固定标题位置（Axes 坐标系）
+            TITLE_Y = 0.965   # 标题位置
+            TABLE_TOP = 0.92  # 表格顶部（下面还会用）
+
+            ax.text(
+                0.5,
+                TITLE_Y,
+                title,
+                ha='center',
+                va='center',
+                fontsize=11,
+                fontweight='bold',
+                transform=ax.transAxes,
+            )
 
             # Create table
             table = ax.table(
                 cellText=data,
                 colLabels=headers,
                 cellLoc='center',
-                loc='center',
                 colWidths=[w / sum(cell_widths) for w in cell_widths],
+                bbox=[0, 0, 1, TABLE_TOP],
             )
 
             # Style the table
@@ -1760,7 +1856,13 @@ class MarketSentimentAnalyzer:
             header_cell = table[(0, n_cols - 1)]
             header_cell._loc = 'left'
 
-            plt.tight_layout()
+            fig.subplots_adjust(
+                left=0.01,
+                right=0.99,
+                top=0.92,
+                bottom=0.02
+            )
+
             plt.savefig(output_path, dpi=150, bbox_inches='tight', facecolor='white', pad_inches=0.1)
             plt.close(fig)
 
@@ -1771,6 +1873,164 @@ class MarketSentimentAnalyzer:
             logger.warning(f"[sentiment] 生成表格图片失败: {e}")
             return None
 
+    def _send_image_to_feishu(self, image_path: str) -> bool:
+        """
+        Send image to Feishu using rich text format (to pass keyword check).
+
+        Args:
+            image_path: Path to the image file
+
+        Returns:
+            True if sent successfully, False otherwise
+        """
+        import json
+        import requests
+
+        if not image_path or not os.path.exists(image_path):
+            logger.warning(f"[sentiment] 图片文件不存在: {image_path}")
+            return False
+
+        config = get_config()
+        feishu_url = getattr(config, 'feishu_webhook_url', None)
+        app_id = getattr(config, 'feishu_app_id', None)
+        app_secret = getattr(config, 'feishu_app_secret', None)
+
+        if not feishu_url:
+            logger.debug("[sentiment] 飞书 Webhook 未配置，跳过图片推送")
+            return False
+
+        if not app_id or not app_secret:
+            logger.warning("[sentiment] 飞书 App ID/Secret 未配置，无法发送图片")
+            return False
+
+        try:
+            # Step 1: Get tenant_access_token
+            token_url = "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal"
+            token_resp = requests.post(token_url, json={
+                "app_id": app_id,
+                "app_secret": app_secret
+            }, timeout=10)
+            token_data = token_resp.json()
+            if token_data.get("code") != 0:
+                logger.error(f"[sentiment] 获取飞书 token 失败: {token_data}")
+                return False
+            access_token = token_data.get("tenant_access_token")
+
+            # Step 2: Upload image
+            upload_url = "https://open.feishu.cn/open-apis/im/v1/images"
+            with open(image_path, 'rb') as f:
+                files = {'image': f}
+                data = {'image_type': 'message'}
+                headers = {'Authorization': f'Bearer {access_token}'}
+                upload_resp = requests.post(upload_url, headers=headers, files=files, data=data, timeout=30)
+            upload_data = upload_resp.json()
+            if upload_data.get("code") != 0:
+                logger.error(f"[sentiment] 上传飞书图片失败: {upload_data}")
+                return False
+            image_key = upload_data.get("data", {}).get("image_key")
+            if not image_key:
+                logger.error("[sentiment] 获取 image_key 失败")
+                return False
+
+            # Step 3: Send image via webhook using post (rich text) format
+            filename = os.path.basename(image_path)
+            if 'limit_up' in filename:
+                title = "市场情绪与风向分析 - 涨停股票"
+            elif 'limit_down' in filename:
+                title = "市场情绪与风向分析 - 跌停股票"
+            else:
+                title = "市场情绪与风向分析"
+
+            payload = {
+                "msg_type": "post",
+                "content": {
+                    "post": {
+                        "zh_cn": {
+                            "title": title,
+                            "content": [
+                                [
+                                    {
+                                        "tag": "img",
+                                        "image_key": image_key
+                                    }
+                                ]
+                            ]
+                        }
+                    }
+                }
+            }
+            resp = requests.post(feishu_url, json=payload, timeout=10)
+            result = resp.json()
+            if result.get("code") == 0 or result.get("StatusCode") == 0:
+                logger.info(f"[sentiment] 飞书图片发送成功: {filename}")
+                return True
+            else:
+                logger.error(f"[sentiment] 飞书图片发送失败: {result}")
+                return False
+
+        except Exception as e:
+            logger.error(f"[sentiment] 发送飞书图片异常: {e}")
+            return False
+
+    def _send_image_to_wechat(self, image_path: str) -> bool:
+        """
+        Send image to WeChat Work using base64 encoding.
+
+        Args:
+            image_path: Path to the image file
+
+        Returns:
+            True if sent successfully, False otherwise
+        """
+        import base64
+        import hashlib
+        import requests
+
+        if not image_path or not os.path.exists(image_path):
+            logger.warning(f"[sentiment] 图片文件不存在: {image_path}")
+            return False
+
+        config = get_config()
+        wechat_url = getattr(config, 'wechat_webhook_url', None)
+
+        if not wechat_url:
+            logger.debug("[sentiment] 企业微信 Webhook 未配置，跳过图片推送")
+            return False
+
+        try:
+            # Read image and encode to base64
+            with open(image_path, 'rb') as f:
+                image_data = f.read()
+
+            image_base64 = base64.b64encode(image_data).decode('utf-8')
+            image_md5 = hashlib.md5(image_data).hexdigest()
+
+            payload = {
+                "msgtype": "image",
+                "image": {
+                    "base64": image_base64,
+                    "md5": image_md5
+                }
+            }
+
+            response = requests.post(wechat_url, json=payload, timeout=30)
+
+            if response.status_code == 200:
+                result = response.json()
+                if result.get('errcode') == 0:
+                    logger.info(f"[sentiment] 企业微信图片发送成功: {os.path.basename(image_path)}")
+                    return True
+                else:
+                    logger.error(f"[sentiment] 企业微信图片发送失败: {result}")
+                    return False
+            else:
+                logger.error(f"[sentiment] 企业微信图片请求失败: {response.status_code}")
+                return False
+
+        except Exception as e:
+            logger.error(f"[sentiment] 发送企业微信图片异常: {e}")
+            return False
+
     def run_sentiment_analysis(self) -> str:
         logger.info("[sentiment] 市场情绪与风向分析开始执行...")
         start = time.time()
@@ -1779,6 +2039,7 @@ class MarketSentimentAnalyzer:
 
         # Generate table images and CSV files
         today_str = datetime.now().strftime('%Y%m%d')
+        today_display = datetime.now().strftime('%Y-%m-%d')  # Readable date for titles
         reports_dir = os.path.join(os.path.dirname(__file__), 'src', 'reports')
         if not os.path.exists(reports_dir):
             reports_dir = os.path.join(os.path.dirname(__file__), 'reports')
@@ -1790,11 +2051,13 @@ class MarketSentimentAnalyzer:
         self.limit_down_image_path = None
 
         if sentiment.limit_up_stocks:
+            # Sort stocks by first concept before generating image/CSV
+            sorted_up_stocks = self._sort_stocks_by_first_concept(sentiment.limit_up_stocks)[:40]
             # Generate image
             up_img_path = os.path.join(reports_dir, f'limit_up_table_{today_str}.png')
             if self._generate_limit_table_image(
-                sentiment.limit_up_stocks[:40],
-                f"涨停股票（{today_str}）",
+                sorted_up_stocks,
+                f"{today_display}-涨停股票（前40）",
                 up_img_path,
                 is_limit_up=True
             ):
@@ -1802,17 +2065,19 @@ class MarketSentimentAnalyzer:
             # Generate CSV
             up_csv_path = os.path.join(reports_dir, f'limit_up_table_{today_str}.csv')
             self._generate_limit_table_csv(
-                sentiment.limit_up_stocks[:40],
+                sorted_up_stocks,
                 up_csv_path,
                 is_limit_up=True
             )
 
         if sentiment.limit_down_stocks:
+            # Sort stocks by first concept before generating image/CSV
+            sorted_down_stocks = self._sort_stocks_by_first_concept(sentiment.limit_down_stocks)[:30]
             # Generate image
             down_img_path = os.path.join(reports_dir, f'limit_down_table_{today_str}.png')
             if self._generate_limit_table_image(
-                sentiment.limit_down_stocks[:25],
-                f"跌停股票（{today_str}）",
+                sorted_down_stocks,
+                f"{today_display}-跌停股票（前30）",
                 down_img_path,
                 is_limit_up=False
             ):
@@ -1820,10 +2085,18 @@ class MarketSentimentAnalyzer:
             # Generate CSV
             down_csv_path = os.path.join(reports_dir, f'limit_down_table_{today_str}.csv')
             self._generate_limit_table_csv(
-                sentiment.limit_down_stocks[:25],
+                sorted_down_stocks,
                 down_csv_path,
                 is_limit_up=False
             )
+
+        # Send images to Feishu and WeChat Work
+        if self.limit_up_image_path:
+            self._send_image_to_feishu(self.limit_up_image_path)
+            self._send_image_to_wechat(self.limit_up_image_path)
+        if self.limit_down_image_path:
+            self._send_image_to_feishu(self.limit_down_image_path)
+            self._send_image_to_wechat(self.limit_down_image_path)
 
         logger.info(f"[sentiment] 市场情绪与风向分析执行完成，耗时 {time.time() - start:.1f} 秒。")
         return report
